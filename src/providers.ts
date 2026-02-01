@@ -21,9 +21,13 @@ import {
   OpenAICompatibleAdapter,
   OpenAICompletionsAdapter,
   BedrockAdapter,
+  AnthropicXmlFormatter,
+  NativeFormatter,
+  CompletionsFormatter,
 } from '@animalabs/membrane';
+import type { PrefillFormatter, RetryConfig as MembraneRetryConfig } from '@animalabs/membrane';
 import type { Config } from './config.js';
-import type { ProviderConfig } from './types.js';
+import type { ProviderConfig, RetryConfig } from './types.js';
 
 export type ProviderName = 
   | 'anthropic' 
@@ -100,23 +104,60 @@ export function initializeProviders(config: Config): void {
 }
 
 /**
+ * Options for creating a Membrane instance
+ */
+export interface CreateMembraneOptions {
+  /** Formatter type: 'xml' (default), 'native', or 'completions' */
+  formatter?: 'xml' | 'native' | 'completions';
+  /** Retry configuration */
+  retry?: RetryConfig;
+}
+
+/**
+ * Get formatter instance by type
+ */
+function getFormatter(type?: 'xml' | 'native' | 'completions'): PrefillFormatter {
+  switch (type) {
+    case 'native':
+      return new NativeFormatter();
+    case 'completions':
+      return new CompletionsFormatter();
+    case 'xml':
+    default:
+      return new AnthropicXmlFormatter();
+  }
+}
+
+/**
  * Create a membrane instance for a request.
  * 
  * @param provider - Which provider to use
  * @param apiKey - Simple API key (BYOK), or null to use server fallback
  * @param providerConfig - Full provider config for complex providers (Bedrock, custom endpoints)
+ * @param options - Additional options (formatter, retry config)
  * @returns Membrane instance configured with the appropriate adapter
  * @throws Error if no API key is available
  */
 export function createMembrane(
   provider: ProviderName, 
   apiKey?: string | null,
-  providerConfig?: ProviderConfig
+  providerConfig?: ProviderConfig,
+  options?: CreateMembraneOptions
 ): Membrane {
   const adapter = createAdapter(provider, apiKey, providerConfig);
   
+  // Build retry config if provided
+  const retry: MembraneRetryConfig | undefined = options?.retry ? {
+    maxRetries: options.retry.maxRetries ?? 3,
+    retryDelayMs: options.retry.retryDelayMs ?? 1000,
+    backoffMultiplier: options.retry.backoffMultiplier ?? 2,
+    maxRetryDelayMs: options.retry.maxRetryDelayMs ?? 30000,
+  } : undefined;
+  
   return new Membrane(adapter, {
     assistantParticipant: 'Claude',
+    formatter: getFormatter(options?.formatter),
+    retry,
   });
 }
 

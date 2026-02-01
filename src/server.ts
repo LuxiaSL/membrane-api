@@ -13,19 +13,25 @@ import type {
   ToolResult,
   NormalizedResponse,
   AbortedResponse,
+  ContextInput,
+  ContextState as MembraneContextState,
 } from '@animalabs/membrane';
-import { isAbortedResponse } from '@animalabs/membrane';
+import { isAbortedResponse, processContext, createInitialState } from '@animalabs/membrane';
 
 import type { Config } from './config.js';
 import {
   CompletionRequestSchema,
+  ContextRequestSchema,
   type CompletionRequest,
+  type ContextRequest,
   type CompletionResponse,
   type StreamEvent,
   type HealthResponse,
   type ModelsResponse,
   type ErrorResponse,
   type ContentBlock,
+  type ContextState,
+  type ContextInfo,
 } from './types.js';
 import {
   createMembrane,
@@ -47,6 +53,23 @@ import {
 // Package version (updated manually or via build)
 const VERSION = '1.0.0';
 const startTime = Date.now();
+
+// Track active streams for abortion
+const activeStreams = new Map<string, AbortController>();
+
+/**
+ * Generate a unique stream ID
+ */
+function generateStreamId(): string {
+  return `str_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Clean up stream tracking
+ */
+function cleanupStream(streamId: string): void {
+  activeStreams.delete(streamId);
+}
 
 /**
  * Create and configure the Fastify server
@@ -334,8 +357,11 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
     const provider = (req.provider ?? config.defaultProvider) as ProviderName;
 
     try {
-      // Create membrane instance with BYOK or fallback key
-      const membrane = createMembrane(provider, req.apiKey, req.providerConfig);
+      // Create membrane instance with BYOK or fallback key, formatter, and retry config
+      const membrane = createMembrane(provider, req.apiKey, req.providerConfig, {
+        formatter: req.formatter,
+        retry: req.retry,
+      });
       const normalizedRequest = buildNormalizedRequest(req, config);
 
       const startMs = Date.now();
@@ -374,6 +400,11 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
     const req = parseResult.data;
     const provider = (req.provider ?? config.defaultProvider) as ProviderName;
 
+    // Generate stream ID for tracking and potential abortion
+    const streamId = generateStreamId();
+    const abortController = new AbortController();
+    activeStreams.set(streamId, abortController);
+
     // Set up SSE headers
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -386,9 +417,15 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
       reply.raw.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
     };
 
+    // Send stream_start event with stream ID for client to track/abort
+    sendEvent({ event: 'stream_start', data: { streamId } });
+
     try {
-      // Create membrane instance with BYOK or fallback key
-      const membrane = createMembrane(provider, req.apiKey, req.providerConfig);
+      // Create membrane instance with BYOK or fallback key, formatter, and retry config
+      const membrane = createMembrane(provider, req.apiKey, req.providerConfig, {
+        formatter: req.formatter,
+        retry: req.retry,
+      });
       const normalizedRequest = buildNormalizedRequest(req, config);
 
       const startMs = Date.now();
@@ -411,11 +448,13 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
           },
         });
         reply.raw.end();
+        cleanupStream(streamId);
         return;
       }
 
       const response = await membrane.stream(normalizedRequest, {
         timeoutMs: config.requestTimeoutMs,
+        signal: abortController.signal,
 
         onChunk: (chunk, meta) => {
           rawAssistantText += chunk;
@@ -451,6 +490,13 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
           }
         },
 
+        onPreToolContent: async (content) => {
+          sendEvent({
+            event: 'pre_tool_content',
+            data: { text: content },
+          });
+        },
+
         onUsage: (usage) => {
           totalUsage = { ...usage };
           sendEvent({
@@ -471,14 +517,18 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
 
         // If there are tool calls and client should handle them
         if (normalResponse.toolCalls.length > 0 && normalResponse.stopReason === 'tool_use') {
-          // Create session for continuation (store API key and config for BYOK)
+          // Create session for continuation (store API key, config, formatter, and retry for BYOK)
           const session = createSession(provider, normalizedRequest, {
             rawAssistantText: normalResponse.rawAssistantText,
             contentBlocks: normalResponse.content,
             toolCalls: normalResponse.toolCalls,
             executedToolResults: [],
             usage: normalResponse.usage,
-          }, { apiKey: req.apiKey, providerConfig: req.providerConfig });
+          }, {
+            apiKey: req.apiKey,
+            providerConfig: req.providerConfig,
+            membraneOptions: { formatter: req.formatter, retry: req.retry },
+          });
 
           sendEvent({
             event: 'tool_calls',
@@ -519,6 +569,7 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
         data: errorInfo,
       });
     } finally {
+      cleanupStream(streamId);
       reply.raw.end();
     }
   });
@@ -560,6 +611,11 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
       return;
     }
 
+    // Generate stream ID for tracking and potential abortion
+    const streamId = generateStreamId();
+    const abortController = new AbortController();
+    activeStreams.set(streamId, abortController);
+
     // Set up SSE headers
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -572,9 +628,17 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
       reply.raw.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
     };
 
+    // Send stream_start event
+    sendEvent({ event: 'stream_start', data: { streamId } });
+
     try {
-      // Recreate membrane with the stored API key and config (BYOK) or fallback
-      const membrane = createMembrane(session.provider, session.apiKey, session.providerConfig);
+      // Recreate membrane with the stored API key, config, formatter, and retry (BYOK)
+      const membrane = createMembrane(
+        session.provider,
+        session.apiKey,
+        session.providerConfig,
+        session.membraneOptions
+      );
 
       // Build continued request with tool results
       const toolResults = body.toolResults.map(r => ({
@@ -614,6 +678,8 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
       const startMs = Date.now();
 
       const response = await membrane.stream(continuedRequest, {
+        signal: abortController.signal,
+
         onChunk: (chunk, meta) => {
           sendEvent({
             event: 'chunk',
@@ -645,6 +711,13 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
               },
             });
           }
+        },
+
+        onPreToolContent: async (content) => {
+          sendEvent({
+            event: 'pre_tool_content',
+            data: { text: content },
+          });
         },
 
         onUsage: (usage) => {
@@ -709,6 +782,7 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
       const errorInfo = parseError(error);
       sendEvent({ event: 'error', data: errorInfo });
     } finally {
+      cleanupStream(streamId);
       reply.raw.end();
     }
   });
@@ -724,6 +798,243 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
   });
 
   // ==========================================================================
+  // Stream abortion
+  // ==========================================================================
+
+  app.post('/v1/abort/:streamId', async (request: FastifyRequest, reply: FastifyReply) => {
+    const { streamId } = request.params as { streamId: string };
+    
+    const controller = activeStreams.get(streamId);
+    if (!controller) {
+      reply.code(404).send({
+        error: {
+          code: 'stream_not_found',
+          message: 'Stream not found or already completed',
+          retryable: false,
+        },
+      } satisfies ErrorResponse);
+      return;
+    }
+
+    // Abort the stream
+    controller.abort();
+    cleanupStream(streamId);
+    
+    reply.code(200).send({ aborted: true, streamId });
+  });
+
+  // ==========================================================================
+  // Context management streaming
+  // ==========================================================================
+
+  app.post('/v1/context/stream', async (request: FastifyRequest, reply: FastifyReply) => {
+    const parseResult = ContextRequestSchema.safeParse(request.body);
+    if (!parseResult.success) {
+      reply.code(400).send({
+        error: {
+          code: 'invalid_request',
+          message: 'Invalid request body',
+          retryable: false,
+          details: parseResult.error.issues,
+        },
+      } satisfies ErrorResponse);
+      return;
+    }
+
+    const req = parseResult.data;
+    const provider = (req.provider ?? config.defaultProvider) as ProviderName;
+
+    // Generate stream ID for tracking and potential abortion
+    const streamId = generateStreamId();
+    const abortController = new AbortController();
+    activeStreams.set(streamId, abortController);
+
+    // Set up SSE headers
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    const sendEvent = (event: StreamEvent) => {
+      reply.raw.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
+    };
+
+    // Send stream_start event
+    sendEvent({ event: 'stream_start', data: { streamId } });
+
+    try {
+      // Create membrane instance with BYOK or fallback key, formatter, and retry config
+      const membrane = createMembrane(provider, req.apiKey, req.providerConfig, {
+        formatter: req.formatter,
+        retry: req.retry,
+      });
+
+      // Build context input
+      const contextInput: ContextInput = {
+        messages: req.messages.map(m => ({
+          participant: m.participant,
+          content: typeof m.content === 'string'
+            ? [{ type: 'text' as const, text: m.content }]
+            : m.content as MembraneContentBlock[],
+        })),
+        system: req.system,
+        tools: req.tools?.map(t => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema as any,
+        })),
+        config: {
+          model: req.model ?? config.defaultModel,
+          maxTokens: Math.min(req.maxTokens ?? 4096, config.maxTokensLimit),
+          temperature: req.temperature ?? 1.0,
+          thinking: req.thinking,
+        },
+        context: {
+          rolling: {
+            threshold: req.contextConfig.rolling.threshold,
+            buffer: req.contextConfig.rolling.buffer,
+            grace: req.contextConfig.rolling.grace,
+            unit: req.contextConfig.rolling.unit,
+          },
+          limits: req.contextConfig.limits,
+          cache: req.contextConfig.cache,
+        },
+      };
+
+      // Parse context state from request (or null for first call)
+      const contextState: MembraneContextState | null = req.contextState
+        ? {
+            cacheMarkers: req.contextState.cacheMarkers,
+            windowMessageIds: req.contextState.windowMessageIds,
+            messagesSinceRoll: req.contextState.messagesSinceRoll,
+            tokensSinceRoll: req.contextState.tokensSinceRoll,
+            inGracePeriod: req.contextState.inGracePeriod,
+            lastRollTime: req.contextState.lastRollTime,
+            cachedStartMessageId: req.contextState.cachedStartMessageId,
+          }
+        : null;
+
+      const startMs = Date.now();
+
+      // Process with context management
+      const { response, state: newState, info } = await processContext(
+        membrane,
+        contextInput,
+        contextState,
+        {
+          onChunk: (chunk) => {
+            sendEvent({
+              event: 'chunk',
+              data: {
+                text: chunk,
+                type: 'text',
+                visible: true,
+                blockIndex: 0,
+              },
+            });
+          },
+          signal: abortController.signal,
+          onPreToolContent: async (content) => {
+            sendEvent({
+              event: 'pre_tool_content',
+              data: { text: content },
+            });
+          },
+          onUsage: (usage) => {
+            sendEvent({ event: 'usage', data: usage });
+          },
+        }
+      );
+
+      updateProviderHealth(provider, true);
+
+      // Build response with context info
+      if (!isAbortedResponse(response)) {
+        const normalResponse = response as NormalizedResponse;
+        const result = buildCompletionResponse(normalResponse, provider, Date.now() - startMs);
+        
+        // Add context info to response
+        result.context = {
+          state: {
+            cacheMarkers: newState.cacheMarkers,
+            windowMessageIds: newState.windowMessageIds,
+            messagesSinceRoll: newState.messagesSinceRoll,
+            tokensSinceRoll: newState.tokensSinceRoll,
+            inGracePeriod: newState.inGracePeriod,
+            lastRollTime: newState.lastRollTime,
+            cachedStartMessageId: newState.cachedStartMessageId,
+          },
+          info: {
+            didRoll: info.didRoll,
+            messagesDropped: info.messagesDropped,
+            messagesKept: info.messagesKept,
+            cacheMarkers: info.cacheMarkers,
+            cachedTokens: info.cachedTokens,
+            uncachedTokens: info.uncachedTokens,
+            totalTokens: info.totalTokens,
+            hardLimitHit: info.hardLimitHit,
+            cachedStartMessageId: info.cachedStartMessageId,
+          },
+        };
+
+        sendEvent({ event: 'done', data: result });
+      } else {
+        // Aborted response
+        const aborted = response as AbortedResponse;
+        sendEvent({
+          event: 'done',
+          data: {
+            content: aborted.partialContent ?? [],
+            rawAssistantText: aborted.rawAssistantText ?? '',
+            toolCalls: aborted.toolCalls ?? [],
+            toolResults: [],
+            stopReason: 'end_turn',
+            usage: aborted.partialUsage ?? { inputTokens: 0, outputTokens: 0 },
+            model: req.model ?? config.defaultModel,
+            provider,
+            durationMs: Date.now() - startMs,
+            context: {
+              state: {
+                cacheMarkers: newState.cacheMarkers,
+                windowMessageIds: newState.windowMessageIds,
+                messagesSinceRoll: newState.messagesSinceRoll,
+                tokensSinceRoll: newState.tokensSinceRoll,
+                inGracePeriod: newState.inGracePeriod,
+                lastRollTime: newState.lastRollTime,
+                cachedStartMessageId: newState.cachedStartMessageId,
+              },
+              info: {
+                didRoll: info.didRoll,
+                messagesDropped: info.messagesDropped,
+                messagesKept: info.messagesKept,
+                cacheMarkers: info.cacheMarkers,
+                cachedTokens: info.cachedTokens,
+                uncachedTokens: info.uncachedTokens,
+                totalTokens: info.totalTokens,
+                hardLimitHit: info.hardLimitHit,
+                cachedStartMessageId: info.cachedStartMessageId,
+              },
+            },
+          },
+        });
+      }
+    } catch (error) {
+      updateProviderHealth(provider, false);
+
+      const errorInfo = parseError(error);
+      sendEvent({
+        event: 'error',
+        data: errorInfo,
+      });
+    } finally {
+      cleanupStream(streamId);
+      reply.raw.end();
+    }
+  });
+
+  // ==========================================================================
   // Stats endpoint (for monitoring)
   // ==========================================================================
 
@@ -731,6 +1042,7 @@ export async function createServer(config: Config): Promise<FastifyInstance> {
     return {
       uptime: Date.now() - startTime,
       activeSessions: getSessionCount(),
+      activeStreams: activeStreams.size,
       providers: getConfiguredProviders(),
     };
   });

@@ -194,6 +194,83 @@ export const ProviderConfigSchema = z.object({
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
 // =============================================================================
+// Retry Configuration
+// =============================================================================
+
+export const RetryConfigSchema = z.object({
+  maxRetries: z.number().optional(),      // Default: 3
+  retryDelayMs: z.number().optional(),    // Default: 1000
+  backoffMultiplier: z.number().optional(), // Default: 2
+  maxRetryDelayMs: z.number().optional(), // Default: 30000
+});
+
+export type RetryConfig = z.infer<typeof RetryConfigSchema>;
+
+// =============================================================================
+// Context Configuration (for context management endpoints)
+// =============================================================================
+
+export const ContextRollingConfigSchema = z.object({
+  threshold: z.number(),      // Messages/tokens before roll triggers
+  buffer: z.number(),         // Buffer to leave uncached after roll
+  grace: z.number().optional(), // Grace period before forced roll
+  unit: z.enum(['messages', 'tokens']).optional(), // Default: 'messages'
+});
+
+export const ContextLimitsSchema = z.object({
+  maxCharacters: z.number().optional(), // Default: 500000
+  maxTokens: z.number().optional(),
+  maxMessages: z.number().optional(),
+});
+
+export const ContextCacheConfigSchema = z.object({
+  enabled: z.boolean().optional(),      // Default: true
+  points: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]).optional(),
+  minTokens: z.number().optional(),     // Minimum tokens before caching
+  preferUserMessages: z.boolean().optional(), // OpenRouter workaround
+});
+
+export const ContextConfigSchema = z.object({
+  rolling: ContextRollingConfigSchema,
+  limits: ContextLimitsSchema.optional(),
+  cache: ContextCacheConfigSchema.optional(),
+});
+
+export type ContextRequestConfig = z.infer<typeof ContextConfigSchema>;
+
+// Context state (client stores and sends back)
+export const CacheMarkerSchema = z.object({
+  messageId: z.string(),
+  messageIndex: z.number(),
+  tokenEstimate: z.number(),
+});
+
+export const ContextStateSchema = z.object({
+  cacheMarkers: z.array(CacheMarkerSchema),
+  windowMessageIds: z.array(z.string()),
+  messagesSinceRoll: z.number(),
+  tokensSinceRoll: z.number(),
+  inGracePeriod: z.boolean(),
+  lastRollTime: z.string().optional(),
+  cachedStartMessageId: z.string().optional(),
+});
+
+export type ContextState = z.infer<typeof ContextStateSchema>;
+
+// Context info (returned in response)
+export interface ContextInfo {
+  didRoll: boolean;
+  messagesDropped: number;
+  messagesKept: number;
+  cacheMarkers: Array<{ messageId: string; messageIndex: number; tokenEstimate: number }>;
+  cachedTokens: number;
+  uncachedTokens: number;
+  totalTokens: number;
+  hardLimitHit: boolean;
+  cachedStartMessageId?: string;
+}
+
+// =============================================================================
 // Request Schema
 // =============================================================================
 
@@ -240,7 +317,21 @@ export const CompletionRequestSchema = z.object({
   // For simple cases, just pass apiKey. For complex providers, use full config.
   apiKey: z.string().optional(),
   providerConfig: ProviderConfigSchema.optional(),
+
+  // Formatter selection: xml (prefill mode), native (API tools), completions (base models)
+  formatter: z.enum(['xml', 'native', 'completions']).optional(),
+
+  // Retry configuration
+  retry: RetryConfigSchema.optional(),
 });
+
+// Context request extends completion request with context config
+export const ContextRequestSchema = CompletionRequestSchema.extend({
+  contextConfig: ContextConfigSchema,
+  contextState: ContextStateSchema.optional(),
+});
+
+export type ContextRequest = z.infer<typeof ContextRequestSchema>;
 
 export type CompletionRequest = z.infer<typeof CompletionRequestSchema>;
 
@@ -286,6 +377,12 @@ export interface CompletionResponse {
   model: string;
   provider: string;
   durationMs: number;
+
+  // Context info (only present for context endpoints)
+  context?: {
+    state: ContextState;
+    info: ContextInfo;
+  };
 }
 
 // =============================================================================
@@ -293,9 +390,11 @@ export interface CompletionResponse {
 // =============================================================================
 
 export type StreamEvent =
+  | { event: 'stream_start'; data: { streamId: string } }
   | { event: 'chunk'; data: { text: string; type: string; visible: boolean; blockIndex: number } }
   | { event: 'block_start'; data: { index: number; type: string } }
   | { event: 'block_complete'; data: { index: number; type: string; content?: unknown } }
+  | { event: 'pre_tool_content'; data: { text: string } }
   | { event: 'tool_calls'; data: { calls: ToolCall[]; sessionId: string } }
   | { event: 'usage'; data: UsageInfo }
   | { event: 'done'; data: CompletionResponse }

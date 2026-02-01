@@ -6,7 +6,7 @@
  */
 
 import type { NormalizedRequest, ToolCall, ToolResult, ContentBlock } from '@animalabs/membrane';
-import type { ProviderName } from './providers.js';
+import type { ProviderName, CreateMembraneOptions } from './providers.js';
 import type { ProviderConfig } from './types.js';
 
 export interface SessionState {
@@ -18,6 +18,7 @@ export interface SessionState {
   provider: ProviderName;
   apiKey?: string; // BYOK: Store key for continuation requests
   providerConfig?: ProviderConfig; // BYOK: Store full provider config
+  membraneOptions?: CreateMembraneOptions; // Formatter and retry config
   request: NormalizedRequest;
 
   // Accumulated state from streaming
@@ -69,10 +70,11 @@ export function createSession(
   options: {
     apiKey?: string; // BYOK: Store for continuation
     providerConfig?: ProviderConfig; // BYOK: Store full provider config
+    membraneOptions?: CreateMembraneOptions; // Formatter and retry config
     ttlMs?: number;
   } = {}
 ): SessionState {
-  const { apiKey, providerConfig, ttlMs = 5 * 60 * 1000 } = options;
+  const { apiKey, providerConfig, membraneOptions, ttlMs = 5 * 60 * 1000 } = options;
   const id = generateSessionId();
   const now = Date.now();
 
@@ -83,6 +85,7 @@ export function createSession(
     provider,
     apiKey,
     providerConfig,
+    membraneOptions,
     request,
     ...state,
   };
